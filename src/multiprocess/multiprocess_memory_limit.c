@@ -70,10 +70,132 @@ void sig_swap_stub(int signo){
     set_current_gpu_status(2);
 }
 
+// Get environment variable with priority from pid 1 process, fallback to standard getenv if not found
+char* getenv_priority_pid1(const char* env_name) {
+    if (getpid() == 1) {
+        return getenv(env_name);
+    }
+
+    static char value[4096];  // Static buffer for storing the final return value
+    char *buf = NULL;
+    size_t buf_size = 4096;  // Initial buffer size
+    const size_t MIN_READ_SIZE = 4096;  // Minimum read size for each iteration
+    size_t total_read = 0;
+    ssize_t bytes_read;
+    char *current = NULL;    // Current parsing position
+    char *last_env_end = NULL;  // End position of the last complete environment variable
+    int fd;
+
+    if (env_name == NULL) {
+        return NULL;
+    }
+
+    fd = open("/proc/1/environ", O_RDONLY);
+    if (fd == -1) {
+        // fprintf(stderr, "Failed to open PID 1 environment file: %s\n", strerror(errno));
+        return getenv(env_name);
+    }
+
+    // Dynamically allocate initial buffer
+    buf = malloc(buf_size);
+    if (buf == NULL) {
+        close(fd);
+        // fprintf(stderr, "Memory allocation failed\n");
+        return getenv(env_name);
+    }
+
+    // Loop to read and check environment variables
+    while (1) {
+        // Ensure enough space for next read
+        if (total_read + MIN_READ_SIZE > buf_size) {
+            // fprintf(stdout, "Need to expand buffer: current size %zu, required %zu\n",
+            //         buf_size, total_read + MIN_READ_SIZE);
+            size_t new_size = buf_size * 2;
+            char *new_buf = realloc(buf, new_size);
+            if (new_buf == NULL) {
+                free(buf);
+                close(fd);
+                // fprintf(stderr, "Buffer expansion failed\n");
+                return getenv(env_name);
+            }
+            // Adjust pointer positions
+            if (current != NULL) {
+                current = new_buf + (current - buf);
+            }
+            if (last_env_end != NULL) {
+                last_env_end = new_buf + (last_env_end - buf);
+            }
+            buf = new_buf;
+            buf_size = new_size;
+            // fprintf(stdout, "Buffer expanded to: %zu bytes\n", buf_size);
+        }
+
+        bytes_read = read(fd, buf + total_read, buf_size - total_read - 1);  // Reserve one byte for \0
+        // fprintf(stdout, "Bytes read this time: %zd\n", bytes_read);
+
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;  // Interrupted by signal, continue reading
+            }
+            free(buf);
+            close(fd);
+            // fprintf(stderr, "Error reading file: %s\n", strerror(errno));
+            return getenv(env_name);
+        }
+
+        if (bytes_read == 0) {
+            break;  // End of file
+        }
+
+        total_read += bytes_read;
+        buf[total_read] = '\0';  // Ensure string is properly terminated
+        // fprintf(stdout, "Total bytes read: %zu, current buffer size: %zu bytes\n",
+        //         total_read, buf_size);
+
+        // Initialize current pointer if this is the first read
+        if (current == NULL) {
+            current = buf;
+        } else if (last_env_end != NULL) {
+            // Start checking from the end of the last complete environment variable
+            current = last_env_end;
+        }
+
+        // Check environment variables in current buffer
+        while (current < buf + total_read) {
+            char *next_null = strchr(current, '\0');
+            if (next_null == NULL) {
+                // Current environment variable is incomplete, need to read more
+                last_env_end = current;
+                break;
+            }
+
+            char *eq = strchr(current, '=');
+            if (eq != NULL && eq < next_null) {
+                size_t name_len = eq - current;
+                if (strncmp(current, env_name, name_len) == 0 && env_name[name_len] == '\0') {
+                    // Found matching environment variable
+                    strncpy(value, eq + 1, sizeof(value) - 1);
+                    value[sizeof(value) - 1] = '\0';
+                    free(buf);
+                    close(fd);
+                    return value;
+                }
+            }
+            // Move to next environment variable
+            current = next_null + 1;
+            last_env_end = current;
+        }
+    }
+
+    free(buf);
+    close(fd);
+    // printf("Environment variable '%s' not found in PID 1\n", env_name);
+    return getenv(env_name);
+}
 
 // get device memory from env
 size_t get_limit_from_env(const char* env_name) {
-    char* env_limit = getenv(env_name);
+    char* env_limit = getenv_priority_pid1(env_name);
     if (env_limit == NULL) {
         // fprintf(stderr, "No %s set in environment\n", env_name);
         return 0;
@@ -328,7 +450,7 @@ uint64_t nvml_get_device_memory_usage(const int dev) {
         }
     }
     unlock_shrreg();
-    LOG_DEBUG("Device %d current memory %lu / %lu", 
+    LOG_DEBUG("Device %d current memory %lu / %lu",
             dev, usage, region->limit[dev]);
     return usage;
 }
@@ -429,7 +551,7 @@ int fix_lock_shrreg() {
             LOG_INFO("Take upgraded lock (%d)", region_info.pid);
             region->owner_pid = region_info.pid;
             SEQ_POINT_MARK(SEQ_FIX_SHRREG_UPDATE_OWNER_OK);
-            res = 0;     
+            res = 0;
         }
     }
 
@@ -512,7 +634,7 @@ void lock_shrreg() {
                         region->owner_pid = region_info.pid;
                         if (0 == fix_lock_shrreg()) {
                             break;
-                        } 
+                        }
                     }
                 }
                 continue;  // slow wait path
@@ -599,22 +721,22 @@ void print_all() {
         for (int dev=0;dev<CUDA_DEVICE_MAX_COUNT;dev++){
             LOG_INFO("Process %d hostPid: %d, sm: %lu, memory: %lu, record: %lu",
                 region_info.shared_region->procs[i].pid,
-                region_info.shared_region->procs[i].hostpid, 
-                region_info.shared_region->procs[i].device_util[dev].sm_util, 
-                region_info.shared_region->procs[i].monitorused[dev], 
+                region_info.shared_region->procs[i].hostpid,
+                region_info.shared_region->procs[i].device_util[dev].sm_util,
+                region_info.shared_region->procs[i].monitorused[dev],
                 region_info.shared_region->procs[i].used[dev].total);
         }
     }
 }
 
 void child_reinit_flag() {
-    LOG_DEBUG("Detect child pid: %d -> %d", region_info.pid, getpid());   
+    LOG_DEBUG("Detect child pid: %d -> %d", region_info.pid, getpid());
     region_info.init_status = PTHREAD_ONCE_INIT;
 }
 
 int set_active_oom_killer() {
     char *oom_killer_env;
-    oom_killer_env = getenv("ACTIVE_OOM_KILLER");
+    oom_killer_env = getenv_priority_pid1("ACTIVE_OOM_KILLER");
     if (oom_killer_env!=NULL){
         if (strcmp(oom_killer_env,"false") == 0)
             return 0;
@@ -630,7 +752,7 @@ int set_active_oom_killer() {
 
 int set_env_utilization_switch() {
     char *utilization_env;
-    utilization_env = getenv("GPU_CORE_UTILIZATION_POLICY");
+    utilization_env = getenv_priority_pid1("GPU_CORE_UTILIZATION_POLICY");
     if (utilization_env!=NULL){
         if ((strcmp(utilization_env,"FORCE") ==0 ) || (strcmp(utilization_env,"force") ==0))
             return 1;
@@ -687,7 +809,7 @@ void try_create_shrreg() {
         LOG_ERROR("Fail to reseek shrreg %s: errno=%d", shr_reg_file, errno);
     }
     region_info.shared_region = (shared_region_t*) mmap(
-        NULL, SHARED_REGION_SIZE_MAGIC, 
+        NULL, SHARED_REGION_SIZE_MAGIC,
         PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
     shared_region_t* region = region_info.shared_region;
     if (region == NULL) {
@@ -697,7 +819,7 @@ void try_create_shrreg() {
         LOG_ERROR("Fail to lock shrreg %s: errno=%d", shr_reg_file, errno);
     }
     //put_device_info();
-    if (region->initialized_flag != 
+    if (region->initialized_flag !=
           MULTIPROCESS_SHARED_REGION_MAGIC_FLAG) {
         region->major_version = MAJOR_VERSION;
         region->minor_version = MINOR_VERSION;
@@ -717,7 +839,7 @@ void try_create_shrreg() {
             region->priority = atoi(getenv(CUDA_TASK_PRIORITY_ENV));
         region->initialized_flag = MULTIPROCESS_SHARED_REGION_MAGIC_FLAG;
     } else {
-        if (region->major_version != MAJOR_VERSION || 
+        if (region->major_version != MAJOR_VERSION ||
                 region->minor_version != MINOR_VERSION) {
             LOG_ERROR("The current version number %d.%d"
                     " is different from the file's version number %d.%d",
@@ -730,7 +852,7 @@ void try_create_shrreg() {
         for (i = 0; i < CUDA_DEVICE_MAX_COUNT; ++i) {
             if (local_limits[i] != region->limit[i]) {
                 LOG_ERROR("Limit inconsistency detected for %dth device"
-                    ", %lu expected, get %lu", 
+                    ", %lu expected, get %lu",
                     i, local_limits[i], region->limit[i]);
             }
         }
@@ -738,9 +860,9 @@ void try_create_shrreg() {
         for (i = 0; i < CUDA_DEVICE_MAX_COUNT; ++i) {
             if (local_limits[i] != region->sm_limit[i]) {
                 LOG_INFO("SM limit inconsistency detected for %dth device"
-                    ", %lu expected, get %lu", 
+                    ", %lu expected, get %lu",
                     i, local_limits[i], region->sm_limit[i]);
-            //    exit(1); 
+            //    exit(1);
             }
         }
     }
@@ -770,7 +892,7 @@ int update_host_pid() {
     for (i=0;i<region_info.shared_region->proc_num;i++){
         if (region_info.shared_region->procs[i].pid == getpid()){
             if (region_info.shared_region->procs[i].hostpid!=0)
-                pidfound=1; 
+                pidfound=1;
         }
     }
     return 0;
@@ -822,7 +944,7 @@ int set_current_device_memory_limit(const int dev,size_t newlimit) {
     }
     LOG_INFO("dev %d new limit set to %ld",dev,newlimit);
     region_info.shared_region->limit[dev]=newlimit;
-    return 0; 
+    return 0;
 }
 
 uint64_t get_current_device_memory_limit(const int dev) {
@@ -830,7 +952,7 @@ uint64_t get_current_device_memory_limit(const int dev) {
     if (dev < 0 || dev >= CUDA_DEVICE_MAX_COUNT) {
         LOG_ERROR("Illegal device id: %d", dev);
     }
-    return region_info.shared_region->limit[dev];       
+    return region_info.shared_region->limit[dev];
 }
 
 uint64_t get_current_device_memory_monitor(const int dev) {
@@ -876,7 +998,7 @@ int get_utilization_switch() {
         return 1;
     if (env_utilization_switch==2)
         return 0;
-    return region_info.shared_region->utilization_switch; 
+    return region_info.shared_region->utilization_switch;
 }
 
 void suspend_all(){
@@ -914,7 +1036,7 @@ int wait_status_all(int status){
     for (i=0;i<region_info.shared_region->proc_num;i++) {
         LOG_INFO("i=%d pid=%d status=%d",i,region_info.shared_region->procs[i].pid,region_info.shared_region->procs[i].status);
         if ((region_info.shared_region->procs[i].status!=status) && (region_info.shared_region->procs[i].pid!=getpid()))
-            released = 0; 
+            released = 0;
     }
     LOG_INFO("Return released=%d",released);
     return released;
@@ -923,7 +1045,7 @@ int wait_status_all(int status){
 shrreg_proc_slot_t *find_proc_by_hostpid(int hostpid) {
     int i;
     for (i=0;i<region_info.shared_region->proc_num;i++) {
-        if (region_info.shared_region->procs[i].hostpid == hostpid) 
+        if (region_info.shared_region->procs[i].hostpid == hostpid)
             return &region_info.shared_region->procs[i];
     }
     return NULL;
